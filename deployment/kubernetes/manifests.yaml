@@ -1,0 +1,270 @@
+# Kubernetes Deployment for LLM Router
+# PHASE 10: Production Kubernetes manifests
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-router
+
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: router-config
+  namespace: llm-router
+data:
+  APP_ENV: "production"
+  LOG_LEVEL: "INFO"
+  ENABLE_CACHING: "true"
+  ENABLE_ML_ROUTING: "false"
+  ENABLE_RAG_ROUTING: "false"
+
+---
+# Secret for sensitive data (create manually with actual values)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: router-secrets
+  namespace: llm-router
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql+asyncpg://router:CHANGE_ME@postgres:5432/router_db"
+  REDIS_URL: "redis://redis:6379/0"
+  OPENAI_API_KEY: "sk-placeholder"
+  ANTHROPIC_API_KEY: "sk-ant-placeholder"
+  PINECONE_API_KEY: "placeholder"
+
+---
+# Deployment for Router API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router-api
+  namespace: llm-router
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: router-api
+  template:
+    metadata:
+      labels:
+        app: router-api
+    spec:
+      containers:
+      - name: router-api
+        image: llm-router:latest  # Replace with your image
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        envFrom:
+        - configMapRef:
+            name: router-config
+        - secretRef:
+            name: router-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: 8000
+          initialDelaySeconds: 20
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+---
+# Service for Router API
+apiVersion: v1
+kind: Service
+metadata:
+  name: router-api-service
+  namespace: llm-router
+spec:
+  type: ClusterIP
+  selector:
+    app: router-api
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: router-api-hpa
+  namespace: llm-router
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: router-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: router-ingress
+  namespace: llm-router
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+spec:
+  tls:
+  - hosts:
+    - api.your-domain.com
+    secretName: router-tls
+  rules:
+  - host: api.your-domain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: router-api-service
+            port:
+              number: 80
+
+---
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: llm-router
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: router_db
+        - name: POSTGRES_USER
+          value: router
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: router-secrets
+              key: POSTGRES_PASSWORD
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: llm-router
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+---
+# Redis Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: llm-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: llm-router
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
